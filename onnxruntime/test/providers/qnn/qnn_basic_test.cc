@@ -5,11 +5,14 @@
 #include <string>
 #include <thread>
 
+#include "core/providers/cpu/cpu_provider_factory.h"  // For OrtSessionOptionsAppendExecutionProvider_CPU
+#if BUILD_QNN_EP_STATIC_LIB
+#include "core/providers/qnn/qnn_allocator.h"  // Used by QnnHTPBackendTests.UseHtpSharedMemoryAllocatorForInputs
+#endif
+#include "core/session/inference_session.h"
 #include "core/session/onnxruntime_cxx_api.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
 #include "core/session/onnxruntime_run_options_config_keys.h"
-#include "core/providers/cpu/cpu_provider_factory.h"  // For OrtSessionOptionsAppendExecutionProvider_CPU
-#include "core/session/inference_session.h"
 
 #include "test/providers/qnn/qnn_test_utils.h"
 
@@ -1022,6 +1025,132 @@ TEST_F(QnnHTPBackendTests, EPRejectsDynamicShapesF32) {
                   /*verify_output*/ true,
                   &ep_graph_checker);
 }
+
+// Test option for offloading quantization of graph inputs and dequantization of graph outputs to the CPU EP.
+TEST_F(QnnHTPBackendTests, EPOffloadsGraphIOQuantDequant) {
+  // Returns a function that checks that the Q/DQ ops at the graph IO boundary are offloaded to CPU
+  // if the corresponding provider option is enabled.
+  auto graph_checker_builder = [](bool offload_graph_io_quantization) -> std::function<void(const Graph&)> {
+    return [offload_graph_io_quantization](const Graph& graph) {
+      size_t num_q = 0;
+      size_t num_dq = 0;
+      size_t num_qnn_fused_node = 0;
+
+      for (const Node& node : graph.Nodes()) {
+        const std::string& ep_name = node.GetExecutionProviderType();
+        const std::string& op_type = node.OpType();
+
+        if (offload_graph_io_quantization && op_type == "QuantizeLinear") {
+          const bool consumes_graph_input = graph.IsInputsIncludingInitializers(node.InputDefs()[0]);
+          EXPECT_EQ(ep_name, kCpuExecutionProvider);
+          EXPECT_TRUE(consumes_graph_input);
+          num_q += 1;
+        } else if (offload_graph_io_quantization && op_type == "DequantizeLinear") {
+          const bool produces_graph_output = graph.IsOutput(node.OutputDefs()[0]);
+          EXPECT_EQ(ep_name, kCpuExecutionProvider);
+          EXPECT_TRUE(produces_graph_output);
+          num_dq += 1;
+        } else {
+          EXPECT_EQ(ep_name, kQnnExecutionProvider);
+          num_qnn_fused_node += 1;
+        }
+      }
+
+      EXPECT_EQ(num_q, static_cast<size_t>(offload_graph_io_quantization));
+      EXPECT_EQ(num_dq, static_cast<size_t>(offload_graph_io_quantization));
+      EXPECT_EQ(num_qnn_fused_node, 1);
+    };
+  };
+
+  ProviderOptions provider_options;
+#if defined(_WIN32)
+  provider_options["backend_path"] = "QnnHtp.dll";
+#else
+  provider_options["backend_path"] = "libQnnHtp.so";
+#endif
+  const std::vector<std::string> op_types = {
+      "Sigmoid",
+      "Transpose",
+      "Softmax",
+      "Sqrt",
+      "Elu",
+  };
+
+  // Test various QDQ ops with offloading of I/O quantization enabled and disabled.
+  for (auto op_type : op_types) {
+    for (int offload_io_quant = 0; offload_io_quant <= 1; offload_io_quant++) {
+      provider_options["offload_graph_io_quantization"] = offload_io_quant ? "1" : "0";
+      auto graph_checker = graph_checker_builder(offload_io_quant);
+      auto expected_ep_assignment = offload_io_quant ? ExpectedEPNodeAssignment::Some : ExpectedEPNodeAssignment::All;
+
+      float min_val = (op_type == "Sqrt") ? 0.0f : -10.0f;
+      TestInputDef<float> input_def({1, 2, 2, 2}, false, GetFloatDataInRange(min_val, 10.0f, 8));
+      auto f32_model_build_fn = BuildOpTestCase<float>(op_type, {input_def}, {}, {});
+      auto qdq_model_build_fn = BuildQDQOpTestCase<uint8_t>(op_type, {input_def}, {}, {});
+      TestQDQModelAccuracy<uint8_t>(f32_model_build_fn,
+                                    qdq_model_build_fn,
+                                    provider_options,
+                                    /*opset*/ 21,
+                                    expected_ep_assignment,
+                                    /*abs_err*/ QDQTolerance(),
+                                    logging::Severity::kERROR,
+                                    /*qnn_ctx_model_path*/ "",
+                                    /*session_option_pairs*/ {},
+                                    &graph_checker);
+    }
+  }
+}
+
+// Only compile this test when QNN EP is built as a static library. When QNN EP is a shared library,
+// we cannot include internal QNN EP headers that use the provider-bridge API.
+#if BUILD_QNN_EP_STATIC_LIB
+TEST_F(QnnHTPBackendTests, UseHtpSharedMemoryAllocatorForInputs) {
+  ProviderOptions provider_options;
+#if defined(_WIN32)
+  provider_options["backend_path"] = "QnnHtp.dll";
+#else
+  provider_options["backend_path"] = "libQnnHtp.so";
+#endif
+  provider_options["enable_htp_shared_memory_allocator"] = "1";
+
+  std::unique_ptr<IExecutionProvider> qnn_ep;
+  try {
+    qnn_ep = QnnExecutionProviderWithOptions(provider_options);
+  } catch (const OnnxRuntimeException& e) {
+    // handle particular exception that indicates that the libcdsprpc.so / dll can't be loaded
+    // NOTE: To run this on a local Windows ARM64 device, you need to copy libcdsprpc.dll to the build directory:
+    //  - Open File Explorer
+    //  - Go to C:/Windows/System32/DriverStore/FileRepository/
+    //  - Search for a folder that begins with qcnspmcdm8380.inf_arm64_ and open it
+    //  - Copy the libcdsprpc.dll into the build/[PATH CONTAINING onnxruntime.dll] directory of the application.
+    // TODO(adrianlizarraga): Update CMake build for unittests to automatically copy libcdsprpc.dll into build directory
+#if defined(_WIN32)
+    constexpr const char* expected_error_message = "Failed to load libcdsprpc.dll";
+#else
+    constexpr const char* expected_error_message = "Failed to load libcdsprpc.so";
+#endif
+    ASSERT_THAT(e.what(), testing::HasSubstr(expected_error_message));
+    GTEST_SKIP() << "HTP shared memory allocator is unavailable.";
+  }
+
+  AllocatorPtr htp_shared_memory_allocator{};
+  {
+    auto allocators = qnn_ep->CreatePreferredAllocators();
+    ASSERT_FALSE(allocators.empty());
+    auto& allocator = allocators[0];
+    ASSERT_EQ(allocator->Info(), qnn::HtpSharedMemoryAllocator::AssociatedMemoryInfo());
+    htp_shared_memory_allocator = std::move(allocator);
+  }
+
+  auto input_defs = {TestInputDef<float>({1, 2, 2, 2}, false, -10.0f, 10.0f),
+                     TestInputDef<float>({1, 2, 2, 2}, false, -10.0f, 10.0f)};
+  RunQnnModelTest(BuildOpTestCase<float>("Add", input_defs, {}, {}, kOnnxDomain, htp_shared_memory_allocator),
+                  provider_options,
+                  13,
+                  ExpectedEPNodeAssignment::All,
+                  0.008f);
+}
+#endif  // BUILD_QNN_EP_STATIC_LIB
 
 #endif  // defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
 #endif  // !defined(ORT_MINIMAL_BUILD)
