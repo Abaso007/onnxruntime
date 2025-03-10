@@ -908,7 +908,6 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                OpSchema::Optional)
         .Input(9,
                "cache_indirection",
-               // This input is useful for CUDA EP only.
                "A buffer of shape [batch_size, beam_width, max_output_length] where an `[i, j, k]` entry specifies "
                "which beam the `k`-th token came from for the `j`-th beam for batch `i` in the current iteration",
                "M",
@@ -1345,7 +1344,9 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               AttributeProto::FLOAT,
               OPTIONAL_VALUE)
         .Attr("interleaved",
-              "Rotate using interleaved pattern. Default value is 0 (False).",
+              "Indicates whether the input has real and imaginary parts interleaved. "
+              "Default value is 0 (False), meaning the first half of the input consists of real values "
+              "and the second half consists of imaginary values.",
               AttributeProto::INT,
               OPTIONAL_VALUE)
         .Attr("rotary_embedding_dim",
@@ -1491,7 +1492,7 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         .Input(0, "X", "input tensor", "T")
         .Input(1, "bias", "bias tensor", "T", OpSchema::Optional)
         .Output(0, "Y", "output tensor", "T")
-        .TypeConstraint("T", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"}, "Constrain input and output types to float or half tensors.")
+        .TypeConstraint("T", {"tensor(float)", "tensor(double)", "tensor(float16)", "tensor(bfloat16)"}, "Constrain input and output types to float or half tensors.")
         .TypeAndShapeInferenceFunction(ONNX_NAMESPACE::propagateShapeAndTypeFromFirstInput)
         .SetContextDependentFunctionBodyBuilder([](const FunctionBodyBuildContext& ctx, const OpSchema& schema, FunctionProto& functionProto) {
           // fastgelu(x) =
