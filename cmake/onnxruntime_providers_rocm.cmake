@@ -8,7 +8,7 @@
 
   find_package(HIP)
   find_package(hiprand REQUIRED)
-  find_package(rocblas REQUIRED)
+  find_package(hipblas REQUIRED)
   find_package(MIOpen REQUIRED)
   find_package(hipfft REQUIRED)
 
@@ -50,7 +50,7 @@
   find_library(RCCL_LIB rccl REQUIRED)
   find_library(ROCTRACER_LIB roctracer64 REQUIRED)
   find_package(rocm_smi REQUIRED)
-  set(ONNXRUNTIME_ROCM_LIBS roc::rocblas MIOpen hip::hipfft ${ROCM_SMI_LIBRARY} ${RCCL_LIB} ${ROCTRACER_LIB})
+  set(ONNXRUNTIME_ROCM_LIBS roc::hipblas MIOpen hip::hipfft ${ROCM_SMI_LIBRARY} ${RCCL_LIB} ${ROCTRACER_LIB})
   include_directories(${ROCM_SMI_INCLUDE_DIR})
   link_directories(${ROCM_SMI_LIB_DIR})
 
@@ -142,19 +142,19 @@
     ${onnxruntime_rocm_generated_training_ops_cu_srcs})
 
   add_dependencies(onnxruntime_providers_rocm generate_hipified_files onnxruntime_providers_shared ${onnxruntime_EXTERNAL_DEPENDENCIES})
-  target_link_libraries(onnxruntime_providers_rocm PRIVATE ${ONNXRUNTIME_ROCM_LIBS} ${ONNXRUNTIME_PROVIDERS_SHARED} ${ABSEIL_LIBS})
+  target_link_libraries(onnxruntime_providers_rocm PRIVATE ${ONNXRUNTIME_ROCM_LIBS} ${ONNXRUNTIME_PROVIDERS_SHARED} ${ABSEIL_LIBS} Eigen3::Eigen)
   target_include_directories(onnxruntime_providers_rocm SYSTEM
     PRIVATE
       ${ONNXRUNTIME_ROOT}
       ${CMAKE_CURRENT_BINARY_DIR}
       ${CMAKE_CURRENT_BINARY_DIR}/amdgpu/onnxruntime
-      ${eigen_INCLUDE_DIRS}
     PUBLIC
       ${onnxruntime_ROCM_HOME}/include
       ${onnxruntime_ROCM_HOME}/include/roctracer)
 
   set_target_properties(onnxruntime_providers_rocm PROPERTIES LINKER_LANGUAGE CXX)
   set_target_properties(onnxruntime_providers_rocm PROPERTIES FOLDER "ONNXRuntime")
+  target_compile_definitions(onnxruntime_providers_rocm PRIVATE HIPBLAS_V2)
 
   if (onnxruntime_ENABLE_TRAINING)
     target_include_directories(onnxruntime_providers_rocm PRIVATE ${ORTTRAINING_ROOT} ${CMAKE_CURRENT_BINARY_DIR}/amdgpu/orttraining ${MPI_CXX_INCLUDE_DIRS})
@@ -216,7 +216,6 @@
 
   if(UNIX)
     set_property(TARGET onnxruntime_providers_rocm APPEND_STRING PROPERTY LINK_FLAGS "-Xlinker --version-script=${ONNXRUNTIME_ROOT}/core/providers/rocm/version_script.lds -Xlinker --gc-sections")
-    target_link_libraries(onnxruntime_providers_rocm PRIVATE nsync::nsync_cpp)
   else()
     message(FATAL_ERROR "onnxruntime_providers_rocm unknown platform, need to specify shared library exports for it")
   endif()
